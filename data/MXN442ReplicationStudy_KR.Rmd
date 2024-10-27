@@ -1,0 +1,1306 @@
+---
+title: 'Type 2 Diabetes Mellitus (T2DM) in Saudi Arabia: Replication Study'
+author: "Kyle Reardon"
+date: "2024-10-27"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+# Optional - required packages
+# install.packages("readxl")
+# install.packages("ResourceSelection")
+# install.packages("vcd")
+# install.packages(c("xgboost", "neuralnet", "e1071", "randomForest"))
+# install.packages("smotefamily")
+# install.packages("ROSE")
+```
+
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+# Loading libraries
+library(readxl)
+library(dplyr)
+library(glmnet)
+library(car)
+library(ResourceSelection)
+library(vcd)
+library(caret)
+library(randomForest)
+library(e1071)
+library(neuralnet)
+library(xgboost)
+library(pROC)
+library(smotefamily)
+library(ROSE)
+library(DHARMa)
+library(broom)
+library(knitr)
+library(tibble)
+```
+
+## Data Loading & Initial Exploration
+
+There are 3 files available in the Github repository for the project. I am wanting to investigate which of the underlying datasets they represent. All 3 will be loaded initially, with a relevant exploratory undertaking for each. First I will load the data then check the dimensions of each. There are multiple datasets referenced in the paper - one with the original 4896 survey observations, and a larger set that has been balanced with SMOTE. The paper further describes trimming the original 10 predictor variables (plus response) down to 6 significant predictor variables (plus response) after the initial analysis.
+
+```{r}
+# Reading raw data files - there are three available
+var6_xl <- read_excel("../data/Survey dataset 6 variable 6-5-2020.xls")
+bal_xl <- read_excel("../data/Survey dataset labelled balnced data 3-5-2020.xls")
+var6_csv <- read.csv("../data/Survey dataset 6 variable.csv")
+
+```
+
+```{r echo=FALSE}
+# Checking shapes
+cat("Shape of var6_xl:\n")
+print(dim(var6_xl))
+
+cat("\nShape of bal_xl:\n")
+print(dim(bal_xl))
+
+cat("\nShape of var6_csv:\n")
+print(dim(var6_csv))
+```
+
+Now I am wanting to verify whether the 2 x files with 6 variables are identical.
+
+```{r}
+# Converting xl 6var file to DF then int
+var6_xl_df <- as.data.frame(var6_xl)
+var6_xl_df[] <- lapply(var6_xl_df, as.integer)
+
+# Verifying identical
+identical(var6_csv, var6_xl_df)
+```
+
+* I observe the 2 x 6-variable datasets are identical. Moving forward I will only use the 6-variable csv file sourced from the Github repository, which is also available via IEEE DataPort. Please refer to the main pdf report for this project for further details of these sources.
+
+In order to replicate the paper's analysis, I need to use the full 11-variable set with the original survey observations (with 4896 rows). At present there is the synthetically balanced dataset (7806 x 11) and the original survey respondent data trimmed down to the significant variables (4896 x 7). Therefore I must verify if the synthetic rows have been appended to the end of the balanced variable set and if the first 4896 rows are identical for the 7 overlapping columns. 
+
+To verify this, I will trim the balanced dataset down to the 7 mutual variables and remove the last 2910 rows such that the datasets have the same dimensions. If these overlap I can extract the original survey sample from the synthetically balanced set with the full 11 variables given it may be nested within.
+
+```{r}
+# Convert balanced file to DF
+bal_df <- as.data.frame(bal_xl)
+
+# Trimming bal_df to remove rows > 4896
+filt_bal_df <- head(bal_df, 4896)
+
+# Removing additional columns
+cols_to_remove <- which(colnames(filt_bal_df) %in% c("Physical_Activity", "Family_History", "Age", "Waist_Size"))
+reduced_filt_bal_df <- filt_bal_df[, -cols_to_remove]
+
+# Converting for comparison  
+reduced_filt_bal_df[] <- lapply(reduced_filt_bal_df, as.integer)
+identical(reduced_filt_bal_df, var6_csv)
+```
+
+* I conclude the first 4896 rows of the balanced DF overlap with the survey sample (with only 7 variables). Therefore I can derive the raw survey data from the synthetically balanced set with the added observations. 
+* As filt_bal_df is the balanced dataset with 11 variables trimmed down to 4896 rows I will use this. These will be renamed for clarity.
+
+```{r}
+# Renaming the extended sets with 11 variables
+full_bal_df <- bal_df
+full_unbal_df <- filt_bal_df
+
+# Checking shapes for sanity check
+print(dim(full_unbal_df))
+print(dim(full_bal_df))
+```
+
+Now I have two variable sets with the full 11 variables (10 survey questions + response). One represents the raw survey data while the other is the balanced set after SMOTE.
+
+\newpage
+
+# Exploratory Data Analysis & Pre-Processing
+
+```{r echo=FALSE}
+# Inspecting DFs
+cat("\nSynthetically Balanced Data:\n")
+summary(full_bal_df)
+
+cat("\nUnbalanced Raw Survey Data:\n")
+summary(full_unbal_df)
+```
+
+* Whilst means are not meaningful for categorical variables, I will still use them as a barometer here to inspect the datasets as a sanity check.
+* The mean in Class is 0.2022 in the unbalanced set, reflecting the class imbalance (20.22% minority class = high risk diabetics). The mean of Class in the balanced set is 0.5 as expected.
+* The mean of Smoking increases from 0.4 in the unbalanced set to 0.58 in the balanced set, indicating smokers are more prevalent in the synthetic balanced data.
+* BP increases slightly in the balanced set, as do Diet and BMI.
+* Age, Gender and Region appear to remain relatively stable. 
+
+Exploratory plotting and analysis will be conducted on the raw unbalanced data to preserve the integrity.
+
+Existing variable summary, requiring pre-processing (factor conversion):
+
+### Binary factors
+* Diet 
+* Blood pressure medication (BP)
+* Smoking
+* Gender
+* Physical_Activity
+* Class (low/high risk diabetes, based on fasting plasma glucose)
+
+### Ordinal factors - will treat as categorical
+* Waist_Size (3 levels)
+* Age (4 levels)
+* Family_History (3 levels)
+* BMI (3 levels)
+
+### Nominal / categorical
+* Region (10 categories)
+
+Please refer to Table 1 in the main report for the individual categories of these variables.
+
+
+```{r}
+# Converting to factors - unbalanced data
+full_unbal_df$Diet <- factor(full_unbal_df$Diet, levels = c(0, 1))
+full_unbal_df$BP <- factor(full_unbal_df$BP, levels = c(0, 1))
+full_unbal_df$Smoking <- factor(full_unbal_df$Smoking, levels = c(0, 1))
+full_unbal_df$Gender <- factor(full_unbal_df$Gender, levels = c(0, 1))
+full_unbal_df$Physical_Activity <- factor(full_unbal_df$Physical_Activity, levels = c(0, 1)) # Not matching reverse order in paper
+full_unbal_df$Class <- factor(full_unbal_df$Class, levels = c(0, 1))
+full_unbal_df$Waist_Size <- factor(full_unbal_df$Waist_Size, levels = c(0, 1, 2)) # Not matching unnatural order in paper
+full_unbal_df$Age <- factor(full_unbal_df$Age, levels = c(0, 1, 2, 3))
+full_unbal_df$Family_History <- factor(full_unbal_df$Family_History, levels = c(0, 1, 2))
+full_unbal_df$BMI <- factor(full_unbal_df$BMI, levels = c(0, 1, 2))
+full_unbal_df$Region <- factor(full_unbal_df$Region, levels = c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10))
+
+# Converting to factors - balanced data
+full_bal_df$Diet <- factor(full_bal_df$Diet, levels = c(0, 1))
+full_bal_df$BP <- factor(full_bal_df$BP, levels = c(0, 1))
+full_bal_df$Smoking <- factor(full_bal_df$Smoking, levels = c(0, 1))
+full_bal_df$Gender <- factor(full_bal_df$Gender, levels = c(0, 1))
+full_bal_df$Physical_Activity <- factor(full_bal_df$Physical_Activity, levels = c(0, 1)) # Not matching reverse order in paper
+full_bal_df$Class <- factor(full_bal_df$Class, levels = c(0, 1))
+full_bal_df$Waist_Size <- factor(full_bal_df$Waist_Size, levels = c(0, 1, 2)) # Not matching unnatural order in paper
+full_bal_df$Age <- factor(full_bal_df$Age, levels = c(0, 1, 2, 3))
+full_bal_df$Family_History <- factor(full_bal_df$Family_History, levels = c(0, 1, 2))
+full_bal_df$BMI <- factor(full_bal_df$BMI, levels = c(0, 1, 2))
+full_bal_df$Region <- factor(full_bal_df$Region, levels = c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10))
+
+# Checking success
+str(full_unbal_df)
+str(full_bal_df)
+```
+
+Typically when building a logistic regression GLM I would first plot numeric predictors against the log odds of the response to verify a linear relationship exists. This is a fundamental assumption of GLMs. However given the variables have already been binned, I will utilise count tables to summarise the relationships between the various categorical predictors and the response. Although this is not a requirement of GLMs, it provides an overview of relationships in the data. First I will define a function to handle this repeatedly. 
+
+```{r}
+# Defining function to generate the table for a given categorical variable
+create_risk_table <- function(variable) {
+  full_unbal_df %>%
+    group_by({{ variable }}) %>%  # Group by the predictor
+    summarize(
+      category = first({{ variable }}),         
+      count_0 = sum(Class == 0),                
+      count_1 = sum(Class == 1),               
+      prop_high_risk = mean(Class == 1), 
+      logit_prop_high_risk = log(prop_high_risk / (1 - prop_high_risk))
+    ) %>%
+    arrange(desc(prop_high_risk))       # Sort by highest risk
+}
+
+# Region
+region_table <- create_risk_table(Region)
+region_table
+```
+
+* Observe clear differences in risk proportions across differing regions, ranging from 27% high risk (region 10) to 15.7% (region 4). This difference is reflected in the log odds of the response. There are also clear differences in the sample sizes across each region.
+
+```{r}
+# Age
+age_table <- create_risk_table(Age)
+age_table
+```
+
+* Age generally follows the expected natural ordering, as cat 3 (> 60 years old) is the highest odds of high-risk. 
+* However, those < 40 years old (cat. 0) have a slightly higher proportion of high-risk observations than 40 - 49 year olds (cat. 1).
+
+
+```{r}
+# Gender
+gender_table <- create_risk_table(Gender)
+gender_table
+```
+
+* 21.5% of males (cat. 1) in the sample are high-risk, as opposed to 17.4% for females. 
+* I also observe there are more than double the number of males than females in the sample (3345 v 1551).
+
+```{r}
+# BMI
+bmi_table <- create_risk_table(BMI)
+bmi_table
+```
+
+* BMI follows the natural expected ordering, as obese individuals (cat. 2 - BMI > 30) have the highest proportion of high-risk diabetics at 21.5%. Healthy BMI individuals (cat. 0 - BMI < 25) have 15.8% of observations as high-risk diabetics.
+* Only 8.3% of the sample have a healthy BMI (406 observations), with the remainder either overweight or obese.
+
+```{r}
+# Family history
+family_history_table <- create_risk_table(Family_History)
+family_history_table
+```
+
+* Family history appears to influence the odds of being high-risk, as the proportion for each category exceeds 20%. Conversely, only 16.6% of those with no family history are classed as high risk.
+* Those with grandparents/aunties/uncles/cousins (cat. 1) are surprisingly higher odds of being high-risk than those with parents/siblings (cat. 2).
+
+```{r}
+# Smoking
+smoking_table <- create_risk_table(Smoking)
+smoking_table
+```
+
+* 44% of smokers are considered high-risk, while less than 4% of non-smokers are high risk.
+* Approx. 40% of the sample (1979 subjects) are smokers.
+
+```{r}
+# BP
+bp_table <- create_risk_table(BP)
+bp_table
+```
+
+* Those taking BP medication have much higher proportion of high-risk diabetics than those that do not take BP medication.
+* 65% of the sample (3170 subjects) take BP medication.
+
+```{r}
+# Waist size
+ws_table <- create_risk_table(Waist_Size)
+ws_table
+```
+
+
+* Waist size follows the reverse ordering to the 'expected' ordering, as the highest proportion of high-risk subjects 21.8% occurs in level 0. The largest waist category 2 (male > 102cm, female > 88cm) has the lowest proportion with 17.1%.
+
+```{r}
+# Physical activity
+pa_table <- create_risk_table(Physical_Activity)
+pa_table
+```
+
+* Physical activity log odds are quite distinct for the two categories. Interestingly those in cat. 0 (who engage in 30+ minutes of exercise daily) are have 24% in the high-risk category, with only 15% for those in cat. 1 that don't exercise daily.
+
+```{r}
+# Diet
+diet_table <- create_risk_table(Diet)
+diet_table
+```
+
+* 23.5% of subjects that don't eat fruit and vegetables daily (diet cat. 0) are in the high-risk category, in contrast to only 14.2% in the low risk category that do eat fruit and vegetables daily.
+
+\newpage
+
+## Chi-squared independence testing
+
+The study conducts chi-squared independence testing for each of the categorical predictors (10 in total) with the response. They present the results tables, the chi-squared test statistic, degrees of freedom, p-value for the statistic, and the Cramer's V as a measure of the association strength. For binary variables, the paper presents results both with and without continuity correction.
+
+I will define a function to complete the chi-squared independence testing. As the paper states the chi-squared test statistic with and without continuity correction, I will include a check for binary in the function to run the test twice. Each variable will then be passed through the function separately to verify the results are consistent.
+
+```{r}
+# Defining function to run Chi-square test and calculate Cramer's V
+run_chi2_cramer <- function(var_name, df) {
+  # Create contingency table
+  class_table <- table(df[[var_name]], df$Class)
+  
+  # Check for binary
+  is_binary <- length(unique(df[[var_name]])) == 2
+  
+  # Run Chi-square test with and without continuity correction for binary variables
+  if (is_binary) {
+    cat("\nBinary variable detected for", var_name, "\n")
+    
+    # Chi-square test without continuity correction
+    chi2_test_nocont <- chisq.test(class_table, correct = FALSE)
+    cat("\nChi-square test without continuity correction for", var_name, ":\n")
+    print(chi2_test_nocont)
+    
+    # Chi-square test with continuity correction
+    chi2_test_cont <- chisq.test(class_table, correct = TRUE)
+    cat("\nChi-square test with continuity correction for", var_name, ":\n")
+    print(chi2_test_cont)
+    
+    # Calculate Cramer's V
+    cramer_v <- assocstats(class_table)$cramer
+    cat("\nCramer's V for", var_name, ":\n")
+    print(cramer_v)
+    
+    return(list(
+      var_name = var_name,
+      class_table = class_table,
+      chi2_test_nocont = chi2_test_nocont,
+      chi2_test_cont = chi2_test_cont,
+      cramer_v = cramer_v
+    ))
+  } else {
+    # Chi-square test without continuity correction for non-binary variables
+    chi2_test <- chisq.test(class_table)
+    
+    # Calculate Cramer's V
+    cramer_v <- assocstats(class_table)$cramer
+    
+    # Print results
+    cat("\n", var_name, "Class Table:\n")
+    print(class_table)
+    cat("\nChi-square test for", var_name, ":\n")
+    print(chi2_test)
+    cat("\nCramer's V for", var_name, ":\n")
+    print(cramer_v)
+    
+    return(list(
+      var_name = var_name,
+      class_table = class_table,
+      chi2_test = chi2_test,
+      cramer_v = cramer_v
+    ))
+  }
+}
+```
+
+
+```{r}
+# Region
+region_chi2 <- run_chi2_cramer("Region", full_unbal_df)
+```
+
+* For region, the chi-squared test statistic of 33.93, df (9), p-value (0.000092) and Cramer's V (0.083) are all consistent with the paper.
+
+```{r}
+# Age
+age_chi2 <- run_chi2_cramer("Age", full_unbal_df)
+```
+
+* All key Age metrics also match the paper, as shown above.
+
+```{r}
+# Gender
+gender_chi2 <- run_chi2_cramer("Gender", full_unbal_df)
+```
+
+* The contingency table results cannot be verified in the paper as the table shown in the paper is the BMI table. 
+* However, both Chi-squared (with and without continuity correction) match the results reported in the paper,in addition to the p-value for the test without continuity correction (0.000849). The Cramer V of 0.048 also matches.
+* The paper does not report a p-value for the chi-squared test without continuity correction.
+
+
+```{r}
+# BMI
+bmi_chi2 <- run_chi2_cramer("BMI", full_unbal_df)
+```
+
+* All results reported in the paper match the results shown above for BMI.
+
+
+```{r}
+# Waist Size
+ws_chi2 <- run_chi2_cramer("Waist_Size", full_unbal_df)
+```
+
+* All results recorded in the paper match those shown above for waist size.
+* However, the paper does make an error and repeat the BMI chi-squared statistic (7.531) in the waist size section (III Results and Discussion (E)).
+
+```{r}
+# Physical activity
+pa_chi2 <- run_chi2_cramer("Physical_Activity", full_unbal_df)
+```
+
+* All results for physical activity match the chi-squared results presented in the paper.
+
+
+```{r}
+# Diet
+diet_chi2 <- run_chi2_cramer("Diet", full_unbal_df)
+```
+
+* The chi-squared test results for diet match all those from the paper.
+
+```{r}
+# BP
+bp_chi2 <- run_chi2_cramer("BP", full_unbal_df)
+```
+
+* All of the blood pressure chi-squared testing results above match those found in the paper.
+
+```{r}
+# Family history
+fh_chi2 <- run_chi2_cramer("Family_History", full_unbal_df)
+```
+
+* The family history chi-squared test results shown above reflect those found in the paper.
+
+```{r}
+# Smoking
+smoking_chi2 <- run_chi2_cramer("Smoking", full_unbal_df)
+```
+
+* The results shown above for smoking are consistent with those in the paper.
+
+\newpage
+
+
+# Logistic Regression GLM
+
+The paper presents several sets of results related to the logistic regression model. This is presented in the Results and Discussion (section III (K)) of the paper. Table 12 shows forward logistic regression steps for each variable, with the corresponding Wald statistic, degrees of freedom, and significance. The paper further describes odds ratios for smoking (21.314, 95% CI 17.11 - 26.55), and odds ratios of between 1 and 2 for BMI, diet, and regions 2, 5, and 6. They find an odds ratio of Males (Gender = 1) of 0.771. A more comprehensive rundown of these results can be found in the paper's supplementary information document.
+
+in section III (L), the paper presents the results of the Hosmer and Lemeshow test conducted at each step of the forward logistic regression method. These results are pictured in Table 13 of the paper. 
+
+I will extend upon this and also simulate residuals and make predictions in the classification section to gauge goodness of fit.
+
+First I will commence with the baseline logistic regression model with all predictors included.
+
+```{r}
+# Baseline binary logistic regression model
+lr_model <- glm(Class ~ ., family='binomial', data=full_unbal_df)
+summary(lr_model)
+```
+
+* The binary logistic regression results are relatively close to those shown in the supplementary information tables of the paper. The coefficients are accurate to approx. 1 decimal place, or thereabouts.
+* It is important to note the paper incorrectly references regions 2, 5, and 6 as significant. I suspect this may have something to do with how the region categories were coded in reference to the response. This is confirmed as in the supplementary information document table XI, they reference Region 2 (Khulays), Region 5 (Mecca) and Region 6 (Rabigh). In section II of the paper (Methodology) they refer to these as Khulays = 3, Mecca = 6, Rabigh = 7.
+* My results above for regions 3, 6, and 7 broadly match those of the paper for regions 2, 5, and 6 (which are actually 3, 6, 7).
+* In the supplementary info. document table XI, the paper presents all individual categories that are significant. These include Gender male, BMI levels 1 & 2, physical activity, diet, BP, Family history level 2, smoking, and the 3 x regions.
+* These are presented below in a table with the odds ratio and the 95% CI for the odds ratio. 
+* I reversed the baseline category for physical activity so the odds ratio results are approximately the inverse of each other.
+
+```{r}
+# Obtaining model summary
+model_summary <- tidy(lr_model, conf.int = TRUE)
+
+# Defining variables needed
+selected_vars <- c("Region3", "Region6", "Region7", "Gender1", 
+                   "BMI1", "BMI2", "Physical_Activity1", "Diet1", 
+                   "BP1", "Family_History2", "Smoking1")
+
+# Filtering output and exponentiating the OR and CI bounds
+filtered_model <- model_summary %>%
+  filter(term %in% selected_vars) %>%
+  mutate(OR = exp(estimate),  # Exponentiate the coefficient to get OR
+         `95% CI Lower` = exp(conf.low),  # Exponentiate the lower CI bound
+         `95% CI Upper` = exp(conf.high)) %>%  # Exponentiate the upper CI bound
+  dplyr::select(term, estimate, OR, `95% CI Lower`, `95% CI Upper`) %>%
+  rename(
+    "Variable" = term,
+    "Coefficient" = estimate,
+    "Odds Ratio (OR)" = OR
+  ) %>%
+  mutate(across(where(is.numeric), round, 3))  # Round all numeric values to 3 decimal places
+
+# Presenting in table
+kable(filtered_model, caption = "Coefficients and Exponentiated Coefficients (Odds Ratios) with 95% Confidence Intervals")
+
+```
+
+* Plotting significant odds ratios for visualisation.
+
+```{r}
+# Defining significant variables
+selected_vars_plot <- c("Region3", "Region6", "Region7", "Gender1", 
+                        "BMI1", "BMI2", "Physical_Activity1", "Diet1", 
+                        "BP1", "Family_History2", "Smoking1")
+
+# Creating filtered DF
+filtered_model_plot <- model_summary %>%
+  filter(term %in% selected_vars_plot) %>%
+  mutate(OR = exp(estimate),  # Exponentiate the coefficient to get OR
+         `95% CI Lower` = exp(conf.low),  # Exponentiate the lower CI bound
+         `95% CI Upper` = exp(conf.high)) %>%
+  dplyr::select(term, OR, `95% CI Lower`, `95% CI Upper`) %>%
+  rename(Variable = term)
+
+# Plotting
+ggplot(filtered_model_plot, aes(x = OR, y = reorder(Variable, OR))) + 
+  geom_point() + 
+  geom_errorbarh(aes(xmin = `95% CI Lower`, xmax = `95% CI Upper`), height = 0.2) + 
+  geom_vline(xintercept = 1, linetype = "dashed", color = "red") + 
+  labs(title = "Odds Ratios with 95% Confidence Intervals", 
+       x = "Odds Ratio", 
+       y = "Variable") + 
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10))  # Adjust text size for clarity
+```
+
+* Repeating with smoking removed for visual ease in interpretation.
+
+```{r}
+# Defining significant variables (without smoking)
+selected_vars_plot <- c("Region3", "Region6", "Region7", "Gender1", 
+                        "BMI1", "BMI2", "Physical_Activity1", "Diet1", 
+                        "BP1", "Family_History2")
+
+# Creating DF
+filtered_model_plot <- model_summary %>%
+  filter(term %in% selected_vars_plot) %>%
+  mutate(OR = exp(estimate),  
+         `95% CI Lower` = exp(conf.low), 
+         `95% CI Upper` = exp(conf.high)) %>%
+  dplyr::select(term, OR, `95% CI Lower`, `95% CI Upper`) %>%
+  rename(Variable = term)
+
+# Plotting
+ggplot(filtered_model_plot, aes(x = OR, y = reorder(Variable, OR))) + 
+  geom_point() + 
+  geom_errorbarh(aes(xmin = `95% CI Lower`, xmax = `95% CI Upper`), height = 0.2) + 
+  geom_vline(xintercept = 1, linetype = "dashed", color = "red") + 
+  labs(title = "Odds Ratios with 95% Confidence Intervals", 
+       x = "Odds Ratio", 
+       y = "Variable") + 
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10))  # Adjust text size for clarity
+
+```
+
+
+* Now I will attempt to replicate the Wald test results (Table 12 in the paper, section III(K)).  
+
+```{r}
+# Wald test for Logistic Regression
+Anova(lr_model, test = "Wald")
+```
+
+* All results broadly match those presented in the paper to approx. 1 decimal place. There are some small deviations in the Chisq values, for example Smoking is 741.79 above, and 745.41 in the paper. Diet is 39.88 in the paper and 39.48 above in my results.
+* Importantly, the significance levels match those presnted in the paper.
+
+I will now conduct some model fitness analysis. The paper uses the Hosmer Lemeshow test with forward stepwise regression. I will simulate residuals using DHARMa to check model fit and will also use predictive performance in the classification section of this analysis to gauge model fit. The likelihood ratio test (difference of deviance test) will be used as a model selection metric throughout for nested models.
+
+Now I will conduct some exploratory stepwise regression using AIC as the decision metric to gauge if any variables are removed.
+
+```{r, message=FALSE, warning= FALSE, echo=FALSE}
+# Null model for stepwise
+null_model <- glm(Class ~ 1, family='binomial', data=full_unbal_df)
+
+# Forward stepwise selection using AIC - simple model (null to baseline lr)
+step_model <- step(null_model, scope = list(lower = null_model, upper = lr_model), direction = "forward", trace = 0)
+
+# Printing stepwise model summary
+summary(step_model)
+```
+
+
+* I observe only waist size is removed from the model in stepwise regression (from the null model to baseline with all 10 predictors).
+
+```{r echo = FALSE, message = FALSE, warning = FALSE, results = "hide"}
+# Hosmer-Lemeshow test applied at each step of forward logistic regression
+# First cloning df and converting class to numeric for test
+full_unbal_conv <- full_unbal_df
+full_unbal_conv$Class <- as.numeric(as.character(full_unbal_conv$Class))
+
+# Null model
+null_model <- glm(Class ~ 1, family = binomial, data = full_unbal_conv)
+
+# Full model
+full_model <- glm(Class ~ Region + Age + Gender + BMI + Physical_Activity + Diet + BP + Family_History + Smoking + Waist_Size, 
+                  family = binomial, data = full_unbal_conv)
+
+# Stepwise forward selection based on AIC
+stepwise_forward_model <- step(null_model, 
+                               scope = list(lower = null_model, upper = full_model), 
+                               direction = "forward")
+
+# Listing variables
+variables <- c("Region", "Age", "Gender", "BMI", "Physical_Activity", "Diet", "BP", "Family_History", "Smoking", "Waist_Size")
+
+# Initialising current model as null
+current_model <- null_model
+
+# Function to perform Hosmer-Lemeshow test
+perform_hl_test <- function(model, df) {
+  hoslem_test <- hoslem.test(df$Class, fitted(model), g = 10)
+  print(hoslem_test)
+}
+
+# Looping through and applying HL at each step
+for (var in variables) {
+  # Update the formula by adding the next variable
+  current_formula <- as.formula(paste("Class ~", paste(variables[1:which(variables == var)], collapse = " + ")))
+  
+  # Fit the updated model
+  current_model <- glm(current_formula, family = binomial, data = full_unbal_conv)
+  
+  # Print the summary of the current model
+  print(summary(current_model))
+  
+  # Perform the Hosmer-Lemeshow test and print the results
+  cat("\nHosmer-Lemeshow Test for model with", var, "added:\n")
+  perform_hl_test(current_model, full_unbal_conv)
+  cat("\n------------------------------------------\n")
+}
+```
+
+
+* The output results from the above have been suppressed and will be tabulated in the report for discussion and review.
+* Now I will apply the likelihood ratio test for the 10-variable v 9-variable model and simulate residuals with the reduced 9-variable model to gauge model fit.
+
+```{r}
+# Likelihood-ratio test (difference of deviance) for nested models - only difference being waist size removal
+anova(lr_model, step_model, test = "Chisq")
+```
+
+* Conclude given the p-value of 0.146, waist size is not needed in the model. The additional variable does not provide a statistically significant improvement in fit.
+
+```{r}
+# Simulating residuals for model fit
+lr_step_residuals = simulateResiduals(step_model)
+plot(lr_step_residuals)
+```
+
+* The simulated DHARMa residuals above show some deviation from the uniform distribution that indicates a reasonable model fit. The KS test is borderline significant at p = 0.049.
+* Given the sample size of 4896, the residual plot is difficult to discern, however, 2 outliers are present in the top left indicating some potential unexplained variability. 2 outliers is not a major cause for concern given the sample size.
+* Overall the simulated residuals appear to show the residuals deviate somewhat from the uniform distribution, meaning the model shows some lack of fit to the data.
+* The model will be trimmed shortly to 6 variables for the classification section. 
+* Finally I am testing the addition of interaction terms (using the 6 significant variables) to gauge any interesting interactions found in the data.
+
+```{r }
+# Testing complex interaction model
+extended_lr_model <- glm(
+  Class ~ . + Smoking * BMI + Smoking * Diet + Smoking * Region + Smoking * BP +
+    Smoking * Gender + BMI * Diet + BMI * Region + BMI * BP + BMI * Gender +
+    Diet * Region + Diet * BP + Diet * Gender +
+    Region * BP + Region * Gender +
+    BP * Gender,
+  family = binomial(link = "logit"),
+  data = full_unbal_df
+)
+
+# Forward selection from  baseline to extended 
+forward_selected_model <- step(lr_model, scope = list(upper = extended_lr_model), direction = "forward", trace = 0)
+summary(forward_selected_model)
+```
+
+* Observe above two interaction terms are significant; Diet1:BP1 and Gender1:BP1. Both are negative coefficients, indicating the model estimates a reduced probability of being classed as high risk for these interaction terms.
+* The terms are questionable, however. Diet1:BP1 indicates that people who don't eat fruit and vegetables daily and do take BP medication daily have a 90% less chance of being high-risk than those in the baseline categories (who do eat health and don't take BP medication).
+* Gender1:BP1 indicates that males that take BP medication are approx. 50% less likely than females who don't take BP medication to be classed as high risk.
+* Model AIC reduces, indicating a better fit; however, a more parsimonious model is sought given the objectives of the study.
+* Further variables are removed in the classification section that follows.
+
+
+# Classification
+
+The study notes 6 significant variables after the Chi-squared and logistic regression analysis: smoking, diet, blood pressure, BMI, gender and region. Therefore the non-significant variables they found were waist size, physical activity, age and family history.
+
+## Pre-Processing for Classification
+
+The study  trimmed the variable set down to the 6 significant predictors for the classification. This will be undertaken in addition to the class balancing. The study reports using the following SMOTE parameters in SPSS to balance the classes: SMOTE percentage = 295, number of nearest neighbours = 1, random seed = 1.
+
+To avoid data leakage, oversampling will be applied to the unbalanced survey dataset. The study provides the balanced dataset. However, as the classifiers are tested on both the balanced and unbalanced test sets, the below process was adopted to avoid leakage:
+
+1) split unbalanced dataset into train/test 80/20 (4896 obs = approx. 3917 train, 979 test),
+2) apply oversampling to balance classes in training set,
+3) apply oversampling to balance classes in test set (the study does not reporting completing this step, but it does report testing performance on both the balanced and unbalanced sets in Section M, table 14 "using 20% independent unbalanced and balanced test data"),
+4) train each classifier on the synthetically balanced data, and test the performance of each classifier on both the balanced and unbalanced test sets.
+
+This will allow an unbiased comparison of the classifier performances on both balanced and unbalanced data. Of course, the classifier trained on balanced data and tested on unbalanced data will most closely mirror the real-world scenario in which the study launched their online diabetes classification application.
+
+The study ultimately chose their preferred model for the real-time online classification application as the best performer on the balanced test set (Decision Forest). They report fine-tuning this classifier for the eventual adoption in the online application. Only the unbalanced dataset / dataframe will be used moving forward as the balanced sets will be derived from this to avoid leakage.
+
+
+```{r}
+# Removing non-significant variables reported above
+full_unbal_df <- full_unbal_df[, !(colnames(full_unbal_df) %in% c("Waist_Size", "Physical_Activity", "Family_History", "Age"))]
+
+# Checking shape to verify
+print(dim(full_unbal_df))
+```
+
+### Data splitting
+
+```{r}
+# Splitting imbalanced data
+set.seed(1)
+train_index_unbal <- createDataPartition(full_unbal_df$Class, p = 0.8, list = FALSE)
+train_unbal <- full_unbal_df[train_index_unbal, ]
+test_unbal <- full_unbal_df[-train_index_unbal, ]
+
+# Checking
+cat("Training set class distribution:\n")
+table(train_unbal$Class)
+prop.table(table(train_unbal$Class))
+cat("\nTest set class distribution:\n")
+table(test_unbal$Class)
+prop.table(table(test_unbal$Class))
+```
+
+As SMOTE uses k nearest neighbours with the euclidean distance to gauge 'close' neighbours within the same class, it is inherently not suited for categorical data. Distances between neighbours do not carry meaning for categorical coding schemes. Therefore random oversampling will be applied to balance the classes instead of SMOTE. This method will duplicate existing minority class samples to balance the data. Whilst this will lead to duplicates in the set, it will preserve some integrity of the original data as no synthetic samples will be introduced. However, it can lead to overfitting as the model learns from duplicate samples.
+
+## Oversampling
+
+```{r}
+# Random sampling of minority class (instead of SMOTE)
+set.seed(1)
+train_bal <- ovun.sample(Class ~ ., data = train_unbal, method = "over", N = table(train_unbal$Class)[1] * 2)$data
+test_bal <- ovun.sample(Class ~ ., data = test_unbal, method = "over", N = table(test_unbal$Class)[1] * 2)$data
+
+# Checking classes are balanced
+cat("Train set class distribution:\n")
+print(table(train_bal$Class))
+
+cat("\nTest set class distribution:\n")
+print(table(test_bal$Class))
+```
+
+```{r}
+# Sanity check
+cat("Balanced training set:\n")
+summary(train_bal)
+cat("\nBalanced test set:\n")
+summary(test_bal)
+```
+
+
+## Classifier Model Building
+
+The final stage of the analysis involves replicating the classifiers in R. 5 of the classifiers (of the 9 the study tested) will be built in R. The best performing model will be fine-tuned as per the study's approach. 
+
+Please refer to the accompanying report for further details of this process and the rationale behind it. The objective is to replicate the classifier results from the paper in question. The results will be compared with the study once finalised, with a discussion included in the report.
+
+First I will define a custom evaluation function to handle all classifiers except for XGBoost which will be handled separately. This will include logis to check for the model type and handle each appropriately.
+
+
+```{r}
+model_confusion_metrics <- function(model, data, response_var, model_type = "logit", threshold = 0.5) {
+  # Logic to check model type and handle appropriately
+  if (model_type == "svm") {
+    # SVM - obtain probabilities
+    predicted_probs <- attr(predict(model, newdata = data, probability = TRUE), "probabilities")[, 2]
+  } else if (model_type == "logit" || model_type == "nn") {
+    # Predict for logit/NN
+    if (model_type == "nn") {
+      # For NN
+      predicted_probs <- compute(model, data[, -which(colnames(data) == response_var)])$net.result
+    } else {
+      # Predict for logit
+      predicted_probs <- predict(model, newdata = data, type = "response")
+    }
+  } else if (model_type == "rf") {
+    # Random Forest
+    predicted_probs <- predict(model, newdata = data, type = "prob")[, 2]
+  } else if (model_type == "xgb") {
+    # XGBoost
+    predicted_probs <- predict(model, newdata = as.matrix(data))
+  } else {
+    stop("Unsupported model type.")
+  }
+  
+  # Converting probabilities
+  predicted_classes <- ifelse(predicted_probs >= threshold, 1, 0)
+  
+  # Extracting labels
+  actual_values <- as.factor(data[[response_var]])
+  
+  # Generating CM and metrics
+  cm <- confusionMatrix(as.factor(predicted_classes), actual_values, positive = "1")
+  accuracy <- cm$overall["Accuracy"]
+  precision <- cm$byClass["Pos Pred Value"]
+  recall <- cm$byClass["Sensitivity"]
+  f1 <- 2 * ((precision * recall) / (precision + recall))  # F1 calculation
+  roc_obj <- roc(actual_values, predicted_probs)
+  auc_value <- auc(roc_obj)
+  
+  # Printing results
+  cat("Confusion Matrix:\n")
+  print(cm$table)
+  
+  results <- data.frame(
+    Model = deparse(substitute(model)),
+    Threshold = threshold,
+    Accuracy = round(accuracy, 3),
+    Precision = round(precision, 3),
+    Recall = round(recall, 3),
+    F1 = round(f1, 3),
+    AUC = round(auc_value, 3)
+  )
+  
+  return(results)
+}
+```
+
+## 1) SVM Classifier
+
+```{r}
+# 1) SVM Classifier
+svm_model_bal <- svm(Class ~ ., data = train_bal, probability = TRUE)
+pred_svm_bal_prob <- predict(svm_model_bal, test_bal, probability = TRUE)
+pred_svm_bal_prob <- attr(pred_svm_bal_prob, "probabilities")[, 2]
+pred_svm_bal <- ifelse(as.numeric(pred_svm_bal_prob) >= 0.5, 1, 0)
+pred_svm_unbal_prob <- predict(svm_model_bal, test_unbal, probability = TRUE)
+pred_svm_unbal_prob <- attr(pred_svm_unbal_prob, "probabilities")[, 2]
+pred_svm_unbal <- ifelse(as.numeric(pred_svm_unbal_prob) >= 0.5, 1, 0)
+
+# Evaluating
+cat("SVM Results - Balanced test set:\n")
+svm_metrics_bal <- model_confusion_metrics(svm_model_bal, test_bal, "Class", model_type = "svm", threshold = 0.5)
+svm_metrics_bal
+
+cat("SVM Results - Unbalanced test set:\n")
+svm_metrics_unbal <- model_confusion_metrics(svm_model_bal, test_unbal, "Class", model_type = "svm", threshold = 0.5)
+svm_metrics_unbal
+
+```
+
+## Fine-tuning of SVM using grid search
+
+```{r}
+# 1.1) Fine-tuning SVM - starting with a small grid search
+# Defining a small grid for computational resource and time limitations
+svm_tune <- tune(
+  svm,
+  Class ~ .,  
+  data = train_bal, 
+  probability = TRUE,  
+  ranges = list(
+    cost = c(0.1, 1, 10),  # Small grid
+    gamma = c(0.01, 0.1, 1),  # Small grid
+    kernel = c("radial")  # Only radial kernel
+  )
+)
+
+# Best model
+best_svm_model <- svm_tune$best.model
+
+# Printing parameters
+cat("Best parameters from tuning:\n")
+print(svm_tune$best.parameters)
+
+# Predicting probs
+pred_svm_bal_prob <- predict(best_svm_model, test_bal, probability = TRUE)
+pred_svm_bal_prob <- attr(pred_svm_bal_prob, "probabilities")[, 2]
+pred_svm_unbal_prob <- predict(best_svm_model, test_unbal, probability = TRUE)
+pred_svm_unbal_prob <- attr(pred_svm_unbal_prob, "probabilities")[, 2]
+
+# Evaluating
+cat("SVM Results - Balanced test set (after tuning):\n")
+svm_metrics_bal <- model_confusion_metrics(best_svm_model, test_bal, "Class", model_type = "svm", threshold = 0.5)
+print(svm_metrics_bal)
+
+cat("SVM Results - Unbalanced test set (after tuning):\n")
+svm_metrics_unbal <- model_confusion_metrics(best_svm_model, test_unbal, "Class", model_type = "svm", threshold = 0.5)
+print(svm_metrics_unbal)
+
+
+```
+
+* Note performance actually worsens. The grid search maximises accuracy for the training set, which may not necessarily yield better results on the testing set/s. This indicates the model may be overfitting on the training data with the grid search hyperparameters.
+* Conclude the original SVM default hyperparameters are optimal for the SVM classifier.
+
+## 2) Logistic Regression Classifier
+
+```{r}
+# 2) Logistic Regression Classifier
+lr_model_bal <- glm(Class ~ ., family = binomial, data = train_bal)
+pred_lr_bal_prob <- predict(lr_model_bal, test_bal, type = "response")
+pred_lr_bal <- ifelse(pred_lr_bal_prob > 0.5, 1, 0)
+pred_lr_unbal_prob <- predict(lr_model_bal, test_unbal, type = "response")
+pred_lr_unbal <- ifelse(pred_lr_unbal_prob > 0.5, 1, 0)
+
+# Evaluating
+cat("Logistic Regression Results - Balanced test set:\n")
+results_bal <- model_confusion_metrics(lr_model_bal, test_bal, "Class", threshold = 0.5)
+print(results_bal)
+cat("Logistic Regression Results - Unbalanced test set:\n")
+results_unbal <- model_confusion_metrics(lr_model_bal, test_unbal, "Class", threshold = 0.5)
+print(results_unbal)
+```
+
+```{r}
+# Printing model summary for comparison with Ridge & LASSO
+summary(lr_model_bal)
+```
+
+```{r}
+# Simulating residuals for model fit
+lr_bal_residuals = simulateResiduals(lr_model_bal)
+plot(lr_bal_residuals)
+```
+
+* The simulated residuals show an improvement in model fit from the original logistic regression model fit on the unbalanced data with the full variable set.
+* However, this model was trained on oversampled data, which influences the fit results.
+* A more appropriate comparison would be different variable sets trained on the same training set.
+* Now attempting Ridge and LASSO to gauge changes in feature importance and/or improve model performance/fit.
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+# Defining evaluation function - Ridge
+model_confusion_metrics_ridge <- function(predicted_probs, data, response_var, threshold = 0.5) {
+  predicted_classes <- ifelse(predicted_probs >= threshold, 1, 0)
+  actual_values <- as.factor(data[[response_var]]) 
+  
+  cm <- confusionMatrix(as.factor(predicted_classes), actual_values, positive = "1")
+  accuracy <- cm$overall["Accuracy"]
+  precision <- cm$byClass["Pos Pred Value"]
+  recall <- cm$byClass["Sensitivity"]
+  f1 <- 2 * ((precision * recall) / (precision + recall))  # F1 calculation
+  
+  roc_obj <- roc(actual_values, predicted_probs)
+  auc_value <- auc(roc_obj)
+  
+  cat("Confusion Matrix:\n")
+  print(cm$table)
+  
+  results <- data.frame(
+    Model = "Ridge Logistic Regression",
+    Threshold = threshold,
+    Accuracy = round(accuracy, 3),
+    Precision = round(precision, 3),
+    Recall = round(recall, 3),
+    F1 = round(f1, 3),
+    AUC = round(auc_value, 3)
+  )
+  
+  return(results)
+}
+```
+
+## Ridge Regression
+
+```{r warning=FALSE, message=FALSE}
+# Function to check numeric predictors
+ensure_numeric <- function(df) {
+  df[] <- lapply(df, function(x) {
+    if (is.factor(x)) as.numeric(as.character(x)) else as.numeric(x)
+  })
+  return(df)
+}
+
+# One-hot encoding
+one_hot_encode <- function(df) {
+  model_matrix <- model.matrix(~ . - 1, data = df)
+  return(as.data.frame(model_matrix))
+}
+
+# Apply the one-hot encoding to the datasets (assuming this step is already completed)
+train_bal_onehot <- one_hot_encode(train_bal)
+test_bal_onehot <- one_hot_encode(test_bal)
+train_unbal_onehot <- one_hot_encode(train_unbal)
+test_unbal_onehot <- one_hot_encode(test_unbal)
+
+# Checking numeric
+test_bal_numeric <- ensure_numeric(test_bal_onehot)
+test_unbal_numeric <- ensure_numeric(test_unbal_onehot)
+
+# Convert predictors to matrices for glmnet
+x_train_bal <- as.matrix(train_bal_onehot[, -which(colnames(train_bal_onehot) == "Class1")])
+y_train_bal <- as.numeric(train_bal_onehot$Class1)
+
+x_test_bal <- as.matrix(test_bal_numeric[, -which(colnames(test_bal_numeric) == "Class1")])
+x_test_unbal <- as.matrix(test_unbal_numeric[, -which(colnames(test_unbal_numeric) == "Class1")])
+
+# Ridge Logistic Regression (alpha = 0 for ridge)
+set.seed(1)
+ridge_model <- glmnet(x_train_bal, y_train_bal, family = "binomial", alpha = 0)  # Alpha = 0 specifies Ridge regression
+
+# Check model specs (cross-validate to get optimal lambda)
+cv_ridge_model <- cv.glmnet(x_train_bal, y_train_bal, family = "binomial", alpha = 0)
+
+# Get the best lambda value
+ridge_model_best <- cv_ridge_model$glmnet.fit
+best_lambda <- cv_ridge_model$lambda.min
+
+#Predicting using the best lambda
+pred_ridge_bal_prob <- predict(ridge_model_best, newx = x_test_bal, s = best_lambda, type = "response")
+pred_ridge_unbal_prob <- predict(ridge_model_best, newx = x_test_unbal, s = best_lambda, type = "response")
+
+# Evaluating the Ridge model on the balanced test set
+cat("Ridge Logistic Regression Results - Balanced test set:\n")
+ridge_metrics_bal <- model_confusion_metrics_ridge(pred_ridge_bal_prob, test_bal_numeric, "Class1", threshold = 0.5)
+print(ridge_metrics_bal)
+
+# Evaluating the Ridge model on the unbalanced test set
+cat("Ridge Logistic Regression Results - Unbalanced test set:\n")
+ridge_metrics_unbal <- model_confusion_metrics_ridge(pred_ridge_unbal_prob, test_unbal_numeric, "Class1", threshold = 0.5)
+print(ridge_metrics_unbal)
+```
+
+* I observe improved accuracy of high-risk class (Class=1).
+
+Now I am checking the coefficients found by Ridge to compare with the original logit model. 
+
+```{r}
+# Extracting the coefficients at the best lambda (lambda.min)
+ridge_coeffs <- coef(cv_ridge_model, s = "lambda.min")
+
+# Converting to DF
+coeffs_df <- as.data.frame(as.matrix(ridge_coeffs))
+coeffs_df$term <- rownames(coeffs_df)
+
+# Removing row names & renaming cols
+rownames(coeffs_df) <- NULL
+colnames(coeffs_df)[1] <- "Coefficient"
+
+# Exponentiating for OR
+coeffs_df <- coeffs_df %>%
+  mutate(OR = exp(Coefficient))
+
+# Rounding coefficients
+coeffs_df <- coeffs_df %>%
+  mutate(across(where(is.numeric), round, 3))
+
+# Selecting relevant columns for display
+coeffs_df <- coeffs_df %>%
+  dplyr::select(term, Coefficient, OR)
+
+# Displaying table
+kable(coeffs_df, caption = "Ridge Logistic Regression Coefficients and Odds Ratios (OR)")
+
+```
+
+* All model coefficients are shrunk by a reasonable amount with Ridge regression's L2 regularisation. 
+* The model performs better than the regular logistic regression without regularisation using all performance metrics.
+* This indicates the ability to shrink coefficients has helped the logistic regression's ability to distinguish the classes.
+
+## LASSO Regression
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+# Defining evaluation function - LASSO
+model_confusion_metrics_lasso <- function(predicted_probs, data, response_var, threshold = 0.5) {
+  predicted_classes <- ifelse(predicted_probs >= threshold, 1, 0)
+  actual_values <- as.factor(data[[response_var]]) 
+  
+  cm <- confusionMatrix(as.factor(predicted_classes), actual_values, positive = "1")
+  accuracy <- cm$overall["Accuracy"]
+  precision <- cm$byClass["Pos Pred Value"]
+  recall <- cm$byClass["Sensitivity"]
+  f1 <- 2 * ((precision * recall) / (precision + recall))  # F1 calculation
+  
+  roc_obj <- roc(actual_values, predicted_probs)
+  auc_value <- auc(roc_obj)
+  
+  cat("Confusion Matrix:\n")
+  print(cm$table)
+  
+  results <- data.frame(
+    Model = "LASSO Logistic Regression",
+    Threshold = threshold,
+    Accuracy = round(accuracy, 3),
+    Precision = round(precision, 3),
+    Recall = round(recall, 3),
+    F1 = round(f1, 3),
+    AUC = round(auc_value, 3)
+  )
+  
+  return(results)
+}
+```
+
+
+```{r warning=FALSE, message=FALSE}
+# Checking numeric
+test_bal_numeric <- ensure_numeric(test_bal_onehot)
+test_unbal_numeric <- ensure_numeric(test_unbal_onehot)
+
+# Converting to matrices
+x_train_bal <- as.matrix(train_bal_onehot[, -which(colnames(train_bal_onehot) == "Class1")])
+y_train_bal <- as.numeric(train_bal_onehot$Class1)
+
+x_test_bal <- as.matrix(test_bal_numeric[, -which(colnames(test_bal_numeric) == "Class1")])
+x_test_unbal <- as.matrix(test_unbal_numeric[, -which(colnames(test_unbal_numeric) == "Class1")])
+
+# Fitting LASSO
+set.seed(1)
+lasso_model <- glmnet(x_train_bal, y_train_bal, family = "binomial", alpha = 1)  # Alpha = 1 specifies LASSO regression
+
+# Checking model specs
+cv_lasso_model <- cv.glmnet(x_train_bal, y_train_bal, family = "binomial", alpha = 1)
+lasso_model_best <- cv_lasso_model$glmnet.fit
+best_lambda <- cv_lasso_model$lambda.min
+
+# Predicting
+pred_lasso_bal_prob <- predict(lasso_model_best, newx = x_test_bal, s = best_lambda, type = "response")
+pred_lasso_unbal_prob <- predict(lasso_model_best, newx = x_test_unbal, s = best_lambda, type = "response")
+
+# Evaluating
+cat("LASSO Logistic Regression Results - Balanced test set:\n")
+lasso_metrics_bal <- model_confusion_metrics_lasso(pred_lasso_bal_prob, test_bal_numeric, "Class1", threshold = 0.5)
+print(lasso_metrics_bal)
+
+cat("LASSO Logistic Regression Results - Unbalanced test set:\n")
+lasso_metrics_unbal <- model_confusion_metrics_lasso(pred_lasso_unbal_prob, test_unbal_numeric, "Class1", threshold = 0.5)
+print(lasso_metrics_unbal)
+
+```
+
+* LASSO regression also improves better than the original logistic regression model. The ridge regression model performs better than the LASSO, however, indicating the variables removed by LASSO (shrank to 0) did not improve model performance.
+
+```{r}
+# Extracting the coefficients at the best lambda (lambda.min) for LASSO
+lasso_coeffs <- coef(cv_lasso_model, s = "lambda.min")
+
+# Converting to DF
+lasso_coeffs_df <- as.data.frame(as.matrix(lasso_coeffs))
+lasso_coeffs_df$term <- rownames(lasso_coeffs_df)
+
+# Removing row names & renaming columns
+rownames(lasso_coeffs_df) <- NULL
+colnames(lasso_coeffs_df)[1] <- "Coefficient"
+
+# Exponentiating coefficients for OR (creating OR column)
+lasso_coeffs_df <- lasso_coeffs_df %>%
+  mutate(OR = exp(Coefficient))
+
+# Rounding coefficients and OR
+lasso_coeffs_df <- lasso_coeffs_df %>%
+  mutate(across(where(is.numeric), round, 3))
+
+# Selecting relevant columns for display
+lasso_coeffs_df <- lasso_coeffs_df %>%
+  dplyr::select(term, Coefficient, OR)
+
+# Displaying table
+kable(lasso_coeffs_df, caption = "LASSO Logistic Regression Coefficients and Odds Ratios (OR)")
+
+```
+
+
+## 3) Neural Network Classifier
+
+First pre-processing for the neural network. This will involve one-hot encoding the categorical variables. 
+
+```{r}
+# One-Hot Encoding Function - intended to be used for neural net and XGBoost for numeric features
+one_hot_encode <- function(df) {
+  model_matrix <- model.matrix(~ . - 1, data = df)  # Removing the intercept
+  return(as.data.frame(model_matrix))}
+
+# Apply to 3 x DFs
+train_bal_onehot <- one_hot_encode(train_bal)
+test_bal_onehot <- one_hot_encode(test_bal)
+test_unbal_onehot <- one_hot_encode(test_unbal)
+
+# Checking shapes for clarity
+dim(train_bal_onehot)
+dim(test_bal_onehot)
+dim(test_unbal_onehot)
+
+```
+
+
+```{r}
+# Fitting neural network
+nn_model_bal <- neuralnet(Class1 ~ ., data = train_bal_onehot, linear.output = FALSE)
+
+# Predicting probabilities for both balanced and unbalanced test sets
+pred_nn_bal_prob <- compute(nn_model_bal, test_bal_onehot[, -which(colnames(test_bal_onehot) == "Class1")])$net.result
+pred_nn_unbal_prob <- compute(nn_model_bal, test_unbal_onehot[, -which(colnames(test_unbal_onehot) == "Class1")])$net.result
+
+# Convert predictions to probabilities (since they are probabilities already)
+pred_nn_bal_prob <- as.vector(pred_nn_bal_prob)
+pred_nn_unbal_prob <- as.vector(pred_nn_unbal_prob)
+
+# Evaluating the Neural Network on the balanced test set
+nn_metrics_bal <- model_confusion_metrics(nn_model_bal, test_bal_onehot, "Class1", model_type = "nn", threshold = 0.5)
+cat("Neural Network Metrics on Balanced Test Set:\n")
+print(nn_metrics_bal)
+
+# Evaluating the Neural Network on the unbalanced test set
+nn_metrics_unbal <- model_confusion_metrics(nn_model_bal, test_unbal_onehot, "Class1", model_type = "nn", threshold = 0.5)
+cat("Neural Network Metrics on Unbalanced Test Set:\n")
+print(nn_metrics_unbal)
+
+```
+
+
+
+## 4) Random Forest (Decision Forest) Classifier
+
+```{r}
+# Defining initial mtry_val - typically set to sqrt(# predictors) as a starting point
+mtry_val <- floor(sqrt(ncol(train_bal) - 1))
+
+# Fitting RF model
+set.seed(1)
+rf_model_bal <- randomForest(Class ~ ., data = train_bal, ntree = 32, 
+                             nodesize = 16, maxnodes = 64, 
+                             mtry = mtry_val)
+
+# Predicting probabilities for both balanced and unbalanced test sets
+pred_rf_bal_prob <- predict(rf_model_bal, test_bal, type = "prob")[, 2]  # Probabilities for class "1"
+pred_rf_unbal_prob <- predict(rf_model_bal, test_unbal, type = "prob")[, 2]  # Probabilities for class "1"
+
+# Evaluating
+rf_metrics_bal <- model_confusion_metrics(rf_model_bal, test_bal, "Class", model_type = "rf", threshold = 0.5)
+cat("Random Forest Metrics on Balanced Test Set:\n")
+print(rf_metrics_bal)
+
+rf_metrics_unbal <- model_confusion_metrics(rf_model_bal, test_unbal, "Class", model_type = "rf", threshold = 0.5)
+cat("Random Forest Metrics on Unbalanced Test Set:\n")
+print(rf_metrics_unbal)
+
+```
+
+
+## 5) XGBoost (Boosted decision tree)
+
+First defining separate evaluation function for XGBoost to handle matrix conversion and evaluation.
+
+```{r}
+# Defining evaluation function for XGBoost
+model_confusion_metrics_xgb <- function(model, data, response_var, threshold = 0.5) {
+  # Convert data to xgb.DMatrix
+  dtest <- xgb.DMatrix(data = as.matrix(data[, -which(colnames(data) == response_var)]))
+  
+  # Predict probabilities using the XGBoost model
+  predicted_probs <- predict(model, newdata = dtest)
+  
+  # Convert probabilities to binary class predictions using threshold
+  predicted_classes <- ifelse(predicted_probs >= threshold, 1, 0)
+  
+  # Extract actual class labels from the dataset
+  actual_values <- as.factor(data[[response_var]])
+  
+  # Generate confusion matrix and calculate metrics
+  cm <- confusionMatrix(as.factor(predicted_classes), actual_values, positive = "1")
+  accuracy <- cm$overall["Accuracy"]
+  precision <- cm$byClass["Pos Pred Value"]
+  recall <- cm$byClass["Sensitivity"]
+  f1 <- 2 * ((precision * recall) / (precision + recall))  # F1 calculation
+  
+  # AUC
+  roc_obj <- roc(actual_values, predicted_probs)
+  auc_value <- auc(roc_obj)
+  
+  # Print confusion matrix and return results as a data frame
+  cat("Confusion Matrix:\n")
+  print(cm$table)
+  
+  results <- data.frame(
+    Model = deparse(substitute(model)),
+    Threshold = threshold,
+    Accuracy = round(accuracy, 3),
+    Precision = round(precision, 3),
+    Recall = round(recall, 3),
+    F1 = round(f1, 3),
+    AUC = round(auc_value, 3)
+  )
+  
+  return(results)
+}
+```
+
+
+Fitting XGBoost below and evaluating model on balanced and unbalanced test sets.
+
+```{r}
+# Converting training set to DMatrix format for XGBoost
+dtrain_bal <- xgb.DMatrix(data = as.matrix(train_bal_onehot[, -which(colnames(train_bal_onehot) == "Class1")]), 
+                          label = as.numeric(train_bal_onehot$Class1))
+
+# Training model
+xgb_model_bal <- xgboost(
+  data = dtrain_bal, 
+  nrounds = 100,  # Number of boosting rounds
+  objective = "binary:logistic", 
+  eval_metric = "logloss",  # Could use logloss or error
+  max_depth = 6,  # Max tree depth
+  eta = 0.3,      # Learning rate
+  lambda = 10,    # L2 regularization
+  alpha = 5,      # L1 regularization
+  verbose = 0     # Suppress output during training
+)
+
+# Evaluating
+xgb_metrics_bal <- model_confusion_metrics_xgb(xgb_model_bal, test_bal_onehot, "Class1", threshold = 0.5)
+cat("XGBoost Metrics on Balanced Test Set:\n")
+print(xgb_metrics_bal)
+
+xgb_metrics_unbal <- model_confusion_metrics_xgb(xgb_model_bal, test_unbal_onehot, "Class1", threshold = 0.5)
+cat("XGBoost Metrics on Unbalanced Test Set:\n")
+print(xgb_metrics_unbal)
+```
+
